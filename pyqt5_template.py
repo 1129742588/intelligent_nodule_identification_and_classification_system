@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QSlider, QTextEdit, QComboBox, QButtonGroup,
     QFileDialog, QMessageBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QEvent, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap, QImage
 
 from run import *
@@ -256,6 +256,15 @@ class MainWindow(QMainWindow):
         self.current_image = None
         self._current_slice = 0
         self._total_slices = 1
+        self._view_zoom = 1.0
+        self._view_center_x = None
+        self._view_center_y = None
+        self._is_panning = False
+        self._pan_last_pos = None
+        self._play_interval_ms = 50
+        self._is_playing = False
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_timer_tick)
 
         # --- 功能完成标记 ---
         self._process_done = {
@@ -273,9 +282,12 @@ class MainWindow(QMainWindow):
         self._init_central()
         self._init_statusbar()
 
+        # 图像交互事件（滚轮缩放 + 鼠标拖拽平移）
+        self.image_label.installEventFilter(self)
+
         # --- 启动时尝试加载已有缓存 ---
         self._try_load_startup_cache()
-
+    
     # ================================================================
     #  一、顶部菜单栏
     # ================================================================
@@ -339,7 +351,7 @@ class MainWindow(QMainWindow):
         menu_help = menubar.addMenu("帮助(&H)")
         a = menu_help.addAction("关于")
         a.triggered.connect(self.on_menu_about)
-
+    
     # ================================================================
     #  二、功能选择区（两行：病例信息 + 功能按钮）
     # ================================================================
@@ -405,7 +417,7 @@ class MainWindow(QMainWindow):
 
         outer_layout.addLayout(process_row)
         self._func_bar = func_bar
-
+    
     # ================================================================
     #  三、主内容区
     # ================================================================
@@ -437,7 +449,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(right_panel, stretch=1)
 
         layout.addLayout(content_layout)
-
+    
     # ================================================================
     #  左侧图像显示面板
     # ================================================================
@@ -522,6 +534,11 @@ class MainWindow(QMainWindow):
         # 切片导航
         slice_bar = QHBoxLayout()
         slice_bar.setSpacing(8)
+
+        self.btn_play = QPushButton("播放")
+        self.btn_play.setCursor(Qt.PointingHandCursor)
+        self.btn_play.clicked.connect(self.on_play_toggle)
+        slice_bar.addWidget(self.btn_play)
 
         btn_prev = QPushButton("上一片")
         btn_prev.setCursor(Qt.PointingHandCursor)
@@ -703,6 +720,195 @@ class MainWindow(QMainWindow):
 
         return pixmap
 
+    def _reset_view_transform(self):
+        """
+        重置图像视图变换状态。
+        - 用法: 当切换图像源时调用，恢复默认缩放与中心。
+        - 参数:
+            - 无。
+        - 返回:
+            - 无。
+        """
+        self._view_zoom = 1.0
+        self._view_center_x = None
+        self._view_center_y = None
+        self._is_panning = False
+        self._pan_last_pos = None
+
+    def _get_current_slice_frame(self):
+        """
+        获取当前切片原始帧数据。
+        - 用法: 提供给缩放/平移映射和显示裁剪计算。
+        - 参数:
+            - 无。
+        - 返回:
+            - np.ndarray | None: 当前切片二维灰度或三通道图像。
+        """
+        if self.current_image is None:
+            return None
+        return self.current_image[self._current_slice]
+
+    def _get_view_window(self, img_h, img_w):
+        """
+        根据缩放与中心计算当前显示窗口。
+        - 用法: 统一输出裁剪窗口，供显示与交互映射复用。
+        - 参数:
+            - img_h: 图像高度。
+            - img_w: 图像宽度。
+        - 返回:
+            - tuple: (x0, y0, crop_w, crop_h, cx, cy)
+        """
+        zoom = max(1.0, float(self._view_zoom))
+        crop_w = max(1, int(round(img_w / zoom)))
+        crop_h = max(1, int(round(img_h / zoom)))
+
+        cx = self._view_center_x if self._view_center_x is not None else (img_w / 2.0)
+        cy = self._view_center_y if self._view_center_y is not None else (img_h / 2.0)
+
+        half_w = crop_w / 2.0
+        half_h = crop_h / 2.0
+        cx = min(max(cx, half_w), max(half_w, img_w - half_w))
+        cy = min(max(cy, half_h), max(half_h, img_h - half_h))
+
+        x0 = int(round(cx - half_w))
+        y0 = int(round(cy - half_h))
+        x0 = min(max(x0, 0), max(0, img_w - crop_w))
+        y0 = min(max(y0, 0), max(0, img_h - crop_h))
+        return x0, y0, crop_w, crop_h, cx, cy
+
+    def _render_frame_with_view(self, frame):
+        """
+        按当前视图变换渲染单帧图像。
+        - 用法: 对当前切片应用缩放/平移窗口后再转换为 QPixmap。
+        - 参数:
+            - frame: 当前切片帧数据。
+        - 返回:
+            - QPixmap: 渲染后的显示图。
+        """
+        img_h, img_w = frame.shape[:2]
+        x0, y0, crop_w, crop_h, cx, cy = self._get_view_window(img_h, img_w)
+        self._view_center_x, self._view_center_y = cx, cy
+
+        if frame.ndim == 2:
+            cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+        else:
+            cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w, :]
+        return self._numpy_to_qpixmap(cropped)
+
+    def _get_display_rect(self, img_h, img_w):
+        """
+        计算图像在 QLabel 中的实际显示区域。
+        - 用法: 鼠标位置到图像坐标映射时使用。
+        - 参数:
+            - img_h: 图像高度。
+            - img_w: 图像宽度。
+        - 返回:
+            - tuple: (off_x, off_y, draw_w, draw_h)
+        """
+        label_w = max(1, self.image_label.width())
+        label_h = max(1, self.image_label.height())
+        scale = min(label_w / img_w, label_h / img_h)
+        draw_w = max(1.0, img_w * scale)
+        draw_h = max(1.0, img_h * scale)
+        off_x = (label_w - draw_w) / 2.0
+        off_y = (label_h - draw_h) / 2.0
+        return off_x, off_y, draw_w, draw_h
+
+    def _label_pos_to_image_pos(self, x, y):
+        """
+        将 QLabel 坐标映射到当前图像坐标。
+        - 用法: 滚轮缩放与拖拽平移时，按鼠标位置进行精确变换。
+        - 参数:
+            - x: 鼠标在 QLabel 上的 x 坐标。
+            - y: 鼠标在 QLabel 上的 y 坐标。
+        - 返回:
+            - tuple | None: (img_x, img_y, rx, ry)；若鼠标不在图像区域返回 None。
+        """
+        frame = self._get_current_slice_frame()
+        if frame is None:
+            return None
+        img_h, img_w = frame.shape[:2]
+
+        x0, y0, crop_w, crop_h, _, _ = self._get_view_window(img_h, img_w)
+        off_x, off_y, draw_w, draw_h = self._get_display_rect(crop_h, crop_w)
+
+        if x < off_x or x > off_x + draw_w or y < off_y or y > off_y + draw_h:
+            return None
+
+        rx = (x - off_x) / draw_w
+        ry = (y - off_y) / draw_h
+        img_x = x0 + rx * crop_w
+        img_y = y0 + ry * crop_h
+        return img_x, img_y, rx, ry
+
+    def eventFilter(self, obj, event):
+        """
+        图像交互事件过滤器。
+        - 用法: 处理 image_label 的滚轮缩放、拖拽平移和尺寸变化重绘。
+        - 参数:
+            - obj: 事件目标对象。
+            - event: Qt 事件对象。
+        - 返回:
+            - bool: True 表示事件已处理，False 表示继续默认流程。
+        """
+        if obj is self.image_label and self.current_image is not None:
+            if event.type() == QEvent.Wheel:
+                pos = event.pos()
+                mapped = self._label_pos_to_image_pos(pos.x(), pos.y())
+                if mapped is None:
+                    return True
+
+                px, py, rx, ry = mapped
+                factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
+                new_zoom = min(20.0, max(1.0, self._view_zoom * factor))
+
+                frame = self._get_current_slice_frame()
+                img_h, img_w = frame.shape[:2]
+                new_crop_w = max(1, int(round(img_w / new_zoom)))
+                new_crop_h = max(1, int(round(img_h / new_zoom)))
+
+                # 保持鼠标指向点在缩放前后对应同一图像位置
+                self._view_center_x = px + (0.5 - rx) * new_crop_w
+                self._view_center_y = py + (0.5 - ry) * new_crop_h
+                self._view_zoom = new_zoom
+
+                self._display_current_slice()
+                return True
+
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._is_panning = True
+                self._pan_last_pos = event.pos()
+                self.image_label.setCursor(Qt.ClosedHandCursor)
+                return True
+
+            if event.type() == QEvent.MouseMove and self._is_panning and self._pan_last_pos is not None:
+                frame = self._get_current_slice_frame()
+                img_h, img_w = frame.shape[:2]
+                x0, y0, crop_w, crop_h, cx, cy = self._get_view_window(img_h, img_w)
+                off_x, off_y, draw_w, draw_h = self._get_display_rect(crop_h, crop_w)
+
+                dx = event.pos().x() - self._pan_last_pos.x()
+                dy = event.pos().y() - self._pan_last_pos.y()
+                self._pan_last_pos = event.pos()
+
+                if draw_w > 0 and draw_h > 0:
+                    self._view_center_x = cx - dx * (crop_w / draw_w)
+                    self._view_center_y = cy - dy * (crop_h / draw_h)
+                    self._display_current_slice()
+                return True
+
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._is_panning = False
+                self._pan_last_pos = None
+                self.image_label.setCursor(Qt.ArrowCursor)
+                return True
+
+            if event.type() == QEvent.Resize:
+                self._display_current_slice()
+                return False
+
+        return super().eventFilter(obj, event)
+
     def _display_current_slice(self):
         """
         显示当前切片。
@@ -715,7 +921,7 @@ class MainWindow(QMainWindow):
         if self.current_image is None:
             return
         slice_2d = self.current_image[self._current_slice]
-        pixmap = self._numpy_to_qpixmap(slice_2d)
+        pixmap = self._render_frame_with_view(slice_2d)
         self.image_label.setPixmap(pixmap)
 
     def _build_patch_preview_with_box(self, patch: np.ndarray, patch_mask: np.ndarray) -> np.ndarray:
@@ -832,6 +1038,8 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
+        self._stop_playback()
+        self._reset_view_transform()
         self.current_image = None
         self.image_label.clear()
         self.image_label.setText(f"{name}\n\n尚未生成，请先运行对应流程")
@@ -936,9 +1144,19 @@ class MainWindow(QMainWindow):
 
         # 1. 基础数据
         ct_data_dir = os.path.join(cache_base, "ct_data_array")
+        case_id_path = os.path.join(cache_base, "case_id.txt")
         ct_array_path = os.path.join(ct_data_dir, "ct_array.npy")
         ct_space_info_path = os.path.join(ct_data_dir, "ct_space_info.npy")
         ct_resampled_path = os.path.join(ct_data_dir, "ct_resampled.npy")
+        # 病例id读取
+        if os.path.exists(case_id_path):
+            with open(case_id_path, "r") as f:
+                case_id = f.read().strip()
+            self.case_id = case_id
+            self.case_name_label.setText(self.case_id)
+        else:
+            self.case_id = None
+            self.case_name_label.setText("病例id未知")
         if os.path.exists(ct_array_path) and os.path.exists(ct_space_info_path) and os.path.exists(ct_resampled_path):
             self.ct_array = np.load(ct_array_path)
             self.ct_space_info = np.load(ct_space_info_path, allow_pickle=True).item()
@@ -976,7 +1194,6 @@ class MainWindow(QMainWindow):
         # 4. 结节分割
         nodules_segmentation_results_dir = os.path.join(cache_base, "nodules_segmentation_cache")
         nodules_segmentation_results_path = os.path.join(nodules_segmentation_results_dir, "nodules_segmentation_results.npy")
-        
         if os.path.exists(nodules_segmentation_results_path):
             self.nodule_segmentation_results = np.load(nodules_segmentation_results_path, allow_pickle=True).tolist()
             self._on_nodule_segmentation_done(self.nodule_segmentation_results)
@@ -986,6 +1203,17 @@ class MainWindow(QMainWindow):
             loaded_any = True
         else:
             self._log(f"{prefix} 结节分割结果不完整，无法加载")
+
+        # 5. 分类结果
+        classification_results_dir = os.path.join(cache_base, "nodule_classification_cache")
+        classification_results_path = os.path.join(classification_results_dir, "classification_results.npy")
+        if os.path.exists(classification_results_path):
+            self.classification_results = np.load(classification_results_path, allow_pickle=True).tolist()
+            # 刷新日志显示分类结果摘要
+            self._mark_process_done("结节分类")
+            self.show_classification_results()
+            self._log(f"{prefix} 已加载结节分类结果")
+            loaded_any = True
 
         # 如果加载了数据，显示原始CT
         if loaded_any and self.ct_array is not None:
@@ -1054,17 +1282,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "加载失败", "选择的文件夹不包含有效的结果数据。")
             return
 
-        # 读取摘要
-        summary_path = os.path.join(saved_dir, "summary.txt")
-        if os.path.exists(summary_path):
-            with open(summary_path, "r", encoding="utf-8") as f:
-                summary = f.read()
-            self._log(f"[加载] 摘要:\n{summary}")
-
         # 清空当前状态（但不清 temp_cache，因为不是从 temp_cache 加载）
         self.identify_results = None
         self.nodule_segmentation_results = None
         self.classification_results = None
+        self.case_id = None
+        self.ct_space_info = None
         self.ct_array = None
         self.lung_mask_array = None
         self.nodule_patch = []
@@ -1081,13 +1304,11 @@ class MainWindow(QMainWindow):
         self._load_cache_from_dir(saved_dir, from_saved=True)
 
         # 从摘要提取病例名
-        if os.path.exists(summary_path):
-            with open(summary_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("病例:"):
-                        case_name = line.strip().replace("病例:", "").strip()
-                        self.case_name_label.setText(case_name)
-                        break
+        if os.path.exists(os.path.join(saved_dir, "case_id.txt")):
+            with open(os.path.join(saved_dir, "case_id.txt"), "r") as f:
+                case_id = f.read().strip()
+            self.case_id = case_id
+            self.case_name_label.setText(self.case_id)
 
         self._log(f"[加载] 已从保存结果加载: {saved_dir}")
         self.statusBar().showMessage(f"已加载保存结果: {os.path.basename(saved_dir)}")
@@ -1104,15 +1325,17 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
+        self._stop_playback()
         # 加载新病例前先清除上一个病例的状态和缓存
         self._clear_previous_case()
         # 病例名提示
         self.path = path
-        name = os.path.basename(path) if path else "未选择"
-        self.case_name_label.setText(name)
+        self.case_id = os.path.basename(path) if path else "未选择"
+        self.case_name_label.setText(self.case_id)
         self._log(f"[加载] 正在解析: {path}")
 
         self.ct_array, self.ct_space_info, self.ct_resampled = load_data(path)
+        self._reset_view_transform()
 
         # 默认显示原始CT
         self.current_image = self.ct_array
@@ -1159,7 +1382,7 @@ class MainWindow(QMainWindow):
         if not save_dir:
             return
 
-        case_name = os.path.basename(self.path) if self.path else "unknown_case"
+        case_name = self.case_id if self.case_id else "病例id未知"
         case_name = "".join(c for c in case_name if c.isalnum() or c in "._-")
         target_dir = os.path.join(save_dir, f"results_{case_name}")
 
@@ -1480,9 +1703,11 @@ class MainWindow(QMainWindow):
             else:
                 # total > 1
                 self._current_nodule_idx = 0
-                if self.img_type_group.checkedButton().text() == "结节分割":
+                current_btn = self.img_type_group.checkedButton()
+                current_type = current_btn.text() if current_btn is not None else ""
+                if current_type == "结节分割":
                     self._apply_nodule_display(0)
-                self.nodule_selector_widget.setVisible(True)
+                self.nodule_selector_widget.setVisible(current_type == "结节分割")
 
             self.statusBar().showMessage(f"结节分割完成: 共 {total} 个结节")
         # 恢复按钮状态
@@ -1502,14 +1727,7 @@ class MainWindow(QMainWindow):
         self._mark_process_done("结节分类")
 
         # 在结果信息面板显示
-        lines = []
-        for i, res in enumerate(self.classification_results):
-            lines.append(f"=== 结节 {i+1} ===")
-            for task in res:
-                pred_label = res[task]['pred_label']
-                lines.append(f"  {task}: 预测={pred_label}")
-            lines.append("")
-        self.result_text.setPlainText("\n".join(lines))
+        self.show_classification_results()
 
         self.statusBar().showMessage("结节分类完成")
         self._set_buttons_enabled(True)
@@ -1593,6 +1811,7 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
+        self._stop_playback()
         # 结节选择器显隐
         if name == "结节分割":
             total = len(self.nodule_patch)
@@ -1627,6 +1846,7 @@ class MainWindow(QMainWindow):
         }
         target = mapping[name]
 
+        self._reset_view_transform()
         self.current_image = target
         self._total_slices = self.current_image.shape[0]
 
@@ -1649,6 +1869,7 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
+        self._stop_playback()
         if self._current_slice > 0:
             self._current_slice -= 1
             self.slice_slider.setValue(self._current_slice)
@@ -1662,9 +1883,67 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
+        self._stop_playback()
         if self._current_slice < self._total_slices - 1:
             self._current_slice += 1
             self.slice_slider.setValue(self._current_slice)
+
+    def _on_play_timer_tick(self):
+        """
+        播放定时器回调。
+        - 用法: 每次触发将切片前进一层，到末层自动停止播放。
+        - 参数:
+            - 无。
+        - 返回:
+            - 无。
+        """
+        if self.current_image is None:
+            self._stop_playback()
+            return
+        if self._current_slice >= self._total_slices - 1:
+            self._stop_playback()
+            return
+
+        self._current_slice += 1
+        self.slice_slider.setValue(self._current_slice)
+
+    def _stop_playback(self):
+        """
+        停止切片播放。
+        - 用法: 停止定时器并恢复按钮文案。
+        - 参数:
+            - 无。
+        - 返回:
+            - 无。
+        """
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+        self._is_playing = False
+        if hasattr(self, "btn_play"):
+            self.btn_play.setText("播放")
+
+    def on_play_toggle(self):
+        """
+        回调：播放按钮切换。
+        - 用法: 从当前切片开始自动播放到末层，再自动停止。
+        - 参数:
+            - 无。
+        - 返回:
+            - 无。
+        """
+        if self.current_image is None or self._total_slices <= 1:
+            return
+
+        if self._is_playing:
+            self._stop_playback()
+            return
+
+        if self._current_slice >= self._total_slices - 1:
+            return
+
+        self._is_playing = True
+        self.btn_play.setText("停止")
+        self._play_timer.start(max(10, int(self._play_interval_ms)))
 
     def on_slice_changed(self, value):
         """
@@ -1692,6 +1971,25 @@ class MainWindow(QMainWindow):
         tab_names = ["日志", "结果信息", "中医辨证"]
         if 0 <= index < len(tab_names):
             self._log(f"[面板] 切换到: {tab_names[index]}")
+
+    def show_classification_results(self):
+        """
+        显示分类结果。
+        - 用法: 直接调用，根据分类结果列表展示。
+        - 参数:
+            - 无。
+        """
+        # 在结果信息面板显示
+        lines = []
+        for i, res in enumerate(self.classification_results):
+            lines.append(f"=== 结节 {i+1} ===")
+            for task in res:
+                pred_label = res[task]['pred_label']
+                pred_prob = res[task]['class_probabilities'][pred_label]
+                lines.append(f"  {task}: \t预测={pred_label}, 概率={pred_prob:.2f}")
+            lines.append("")
+        # 直接覆盖显示，不追加
+        self.result_text.setPlainText("\n".join(lines))
 
 
 # ================================================================
