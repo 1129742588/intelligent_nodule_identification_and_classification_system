@@ -1,0 +1,6 @@
+numpy
+pydicom
+tqdm
+scikit-learn
+napari
+SimpleITK
