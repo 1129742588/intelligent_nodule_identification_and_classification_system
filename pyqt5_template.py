@@ -248,8 +248,8 @@ class MainWindow(QMainWindow):
         self.lung_mask_array = None
         self.lung_mask_resampled = None
 
-        self.nodule_segmentation_array = None
-        self.nodule_patches = []
+        self.nodule_patch = []
+        self.nodule_patch_mask = []
         self._current_nodule_idx = 0
 
         # --- 显示状态 ---
@@ -662,12 +662,27 @@ class MainWindow(QMainWindow):
     def _numpy_to_qpixmap(self, array_2d):
         """
         将二维 numpy 图像转换为可显示的 QPixmap。
-        - 用法: 对灰度数据做归一化并缩放到当前图像显示区域尺寸。
+        - 用法: 支持灰度图和 RGB 图，转换后缩放到当前图像显示区域尺寸。
         - 参数:
             - array_2d: 二维图像数组。
         - 返回:
             - QPixmap: 可直接用于 QLabel 显示的图像对象。
         """
+        # RGB 图像直接显示（用于结节红色边缘叠加预览）
+        if array_2d.ndim == 3 and array_2d.shape[2] == 3:
+            rgb = array_2d
+            if rgb.dtype != np.uint8:
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+            rgb = np.ascontiguousarray(rgb)
+            h, w, _ = rgb.shape
+            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+
+            label_size = self.image_label.size()
+            if label_size.width() > 10 and label_size.height() > 10:
+                pixmap = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            return pixmap
+
         if array_2d.dtype != np.uint8:
             min_val = array_2d.min()
             max_val = array_2d.max()
@@ -702,6 +717,67 @@ class MainWindow(QMainWindow):
         slice_2d = self.current_image[self._current_slice]
         pixmap = self._numpy_to_qpixmap(slice_2d)
         self.image_label.setPixmap(pixmap)
+
+    def _build_patch_preview_with_box(self, patch: np.ndarray, patch_mask: np.ndarray) -> np.ndarray:
+        """
+        生成带结节边缘红色线框的显示用 patch 预览（不修改原始数据）。
+        - 用法: 根据 patch_mask 生成紧贴边缘的轮廓线，并叠加到 patch 的 RGB 预览中。
+        - 参数:
+            - patch: 原始结节 patch，形状为 (D, H, W)。
+            - patch_mask: 对应结节 mask，形状为 (D, H, W)。
+        - 返回:
+            - np.ndarray: 仅用于显示的 RGB 预览数组，形状为 (D, H, W, 3)。
+        """
+        patch_float = patch.astype(np.float32, copy=False)
+        d, h, w = patch_float.shape
+
+        # 先按切片生成灰度底图，避免叠加线条导致整张图发暗
+        preview = np.zeros((d, h, w, 3), dtype=np.uint8)
+        for z in range(d):
+            one = patch_float[z]
+            min_val = float(one.min())
+            max_val = float(one.max())
+            if max_val > min_val:
+                gray = ((one - min_val) / (max_val - min_val) * 255.0).astype(np.uint8)
+            else:
+                gray = np.zeros((h, w), dtype=np.uint8)
+            preview[z, :, :, 0] = gray
+            preview[z, :, :, 1] = gray
+            preview[z, :, :, 2] = gray
+
+        if patch_mask is None:
+            return preview
+
+        mask = patch_mask > 0
+        if not np.any(mask):
+            return preview
+
+        # 逐切片提取 mask 边缘（8邻域），使线框紧贴结节轮廓
+        for z in range(d):
+            m = mask[z]
+            if not np.any(m):
+                continue
+
+            p = np.pad(m, 1, mode="constant", constant_values=False)
+            interior = (
+                p[1:-1, 1:-1]
+                & p[:-2, 1:-1]
+                & p[2:, 1:-1]
+                & p[1:-1, :-2]
+                & p[1:-1, 2:]
+                & p[:-2, :-2]
+                & p[:-2, 2:]
+                & p[2:, :-2]
+                & p[2:, 2:]
+            )
+            edge = m & (~interior)
+
+            # 红色边缘
+            preview[z, edge, 0] = 255
+            preview[z, edge, 1] = 0
+            preview[z, edge, 2] = 0
+
+        return preview
 
     def _update_slice_indicator(self):
         """
@@ -738,10 +814,12 @@ class MainWindow(QMainWindow):
         - 返回:
             - bool: True 表示可显示，False 表示数据尚未就绪。
         """
+        if name == "结节分割":
+            return len(self.nodule_patch) > 0
+
         mapping = {
-            "原始CT":   self.ct_array,
+            "原始CT": self.ct_array,
             "肺部分割": self.lung_mask_array,
-            "结节分割": self.nodule_segmentation_array,
         }
         return mapping.get(name) is not None
 
@@ -812,8 +890,8 @@ class MainWindow(QMainWindow):
         self.classification_results = None
         self.ct_array = None
         self.lung_mask_array = None
-        self.nodule_segmentation_array = None
-        self.nodule_patches = []
+        self.nodule_patch = []
+        self.nodule_patch_mask = []
         self._current_nodule_idx = 0
         self.current_image = None
 
@@ -901,9 +979,6 @@ class MainWindow(QMainWindow):
         
         if os.path.exists(nodules_segmentation_results_path):
             self.nodule_segmentation_results = np.load(nodules_segmentation_results_path, allow_pickle=True).tolist()
-            # 存入列表
-            for result in self.nodule_segmentation_results:
-                self.nodule_patches.append((result["patch"],result["patch_mask"]))
             self._on_nodule_segmentation_done(self.nodule_segmentation_results)
 
             self._mark_process_done("结节分割")
@@ -992,8 +1067,8 @@ class MainWindow(QMainWindow):
         self.classification_results = None
         self.ct_array = None
         self.lung_mask_array = None
-        self.nodule_segmentation_array = None
-        self.nodule_patches = []
+        self.nodule_patch = []
+        self.nodule_patch_mask = []
         self._current_nodule_idx = 0
         self.current_image = None
         for name in self._process_done:
@@ -1110,9 +1185,9 @@ class MainWindow(QMainWindow):
                 summary_lines.append(f"原始CT: {self.ct_array.shape[0]}层, {self.ct_array.shape[2]}x{self.ct_array.shape[1]}")
             if self.lung_mask_array is not None:
                 summary_lines.append(f"肺部分割mask: {self.lung_mask_array.shape}")
-            if self.nodule_patches:
-                summary_lines.append(f"结节数量: {len(self.nodule_patches)}")
-                for i, (patch, mask) in enumerate(self.nodule_patches):
+            if self.nodule_patch:
+                summary_lines.append(f"结节数量: {len(self.nodule_patch)}")
+                for i, (patch, mask) in enumerate(zip(self.nodule_patch, self.nodule_patch_mask)):
                     summary_lines.append(f"  结节{i+1}: patch={patch.shape}, mask={'有' if mask is not None else '无'}")
 
             if self.classification_results:
@@ -1373,17 +1448,21 @@ class MainWindow(QMainWindow):
             - 无。
         """
         self.nodule_segmentation_results = result
-        self.nodule_patches = []
+        self.nodule_patch = []
+        self.nodule_patch_mask = []
 
-        if len(result) == 0:
+        for item in result:
+            self.nodule_patch.append(item["patch"])
+            self.nodule_patch_mask.append(item["patch_mask"])
+
+        total = len(self.nodule_patch)
+        if total == 0:
             self._log("[完成] 结节分割: 未检测到结节")
+            self.nodule_combo.blockSignals(True)
+            self.nodule_combo.clear()
+            self.nodule_combo.blockSignals(False)
+            self.nodule_selector_widget.setVisible(False)
         else:
-            for item in result:
-                patch = item['patch']
-                patch_mask = item["patch_mask"]
-                self.nodule_patches.append((patch, patch_mask))
-
-            total = len(self.nodule_patches)
             self._log(f"[完成] 结节分割: 共 {total} 个有效结节")
             self._mark_process_done("结节分割")
 
@@ -1393,16 +1472,17 @@ class MainWindow(QMainWindow):
                 self.nodule_combo.addItem(f"结节 {i + 1}")
             self.nodule_combo.blockSignals(False)
 
-            if total > 0:
+            if total == 1:
                 self._current_nodule_idx = 0
-                self.nodule_segmentation_array = self.nodule_patches[1][1]
-
                 if self.img_type_group.checkedButton().text() == "结节分割":
                     self._apply_nodule_display(0)
-                    self.nodule_selector_widget.setVisible(total > 1)
-            else:
-                self.nodule_segmentation_array = None
                 self.nodule_selector_widget.setVisible(False)
+            else:
+                # total > 1
+                self._current_nodule_idx = 0
+                if self.img_type_group.checkedButton().text() == "结节分割":
+                    self._apply_nodule_display(0)
+                self.nodule_selector_widget.setVisible(True)
 
             self.statusBar().showMessage(f"结节分割完成: 共 {total} 个结节")
         # 恢复按钮状态
@@ -1470,15 +1550,14 @@ class MainWindow(QMainWindow):
         - 返回:
             - 无。
         """
-        if idx < 0 or idx >= len(self.nodule_patches):
+        if idx < 0 or idx >= len(self.nodule_patch):
             return
         self._current_nodule_idx = idx
-        patch, patch_mask = self.nodule_patches[idx]
-        
-        patch = patch_mask
+        patch = self.nodule_patch[idx]
+        patch_mask = self.nodule_patch_mask[idx]
 
-        self.nodule_segmentation_array = patch
-        self.current_image = patch
+        # 仅替换显示数据，不改动原始 patch / patch_mask
+        self.current_image = self._build_patch_preview_with_box(patch, patch_mask)
         self._total_slices = patch.shape[0]
         self._current_slice = self._total_slices // 2
 
@@ -1488,7 +1567,7 @@ class MainWindow(QMainWindow):
         self._display_current_slice()
 
         self.nodule_info_label.setText(
-            f"第 {idx+1}/{len(self.nodule_patches)} 个 | "
+            f"第 {idx+1}/{len(self.nodule_patch)} 个 | "
             f"{patch.shape[0]}层 {patch.shape[2]}x{patch.shape[1]}"
         )
 
@@ -1515,8 +1594,24 @@ class MainWindow(QMainWindow):
             - 无。
         """
         # 结节选择器显隐
-        if name == "结节分割" and len(self.nodule_patches) > 1:
+        if name == "结节分割":
+            total = len(self.nodule_patch)
+            if total == 0:
+                self.nodule_selector_widget.setVisible(False)
+                self._show_image_placeholder(name)
+                self._log(f"[图像] {name} 尚未生成")
+                return
+            if total == 1:
+                self.nodule_selector_widget.setVisible(False)
+                self._apply_nodule_display(0)
+                self._log(f"[图像] 切换到: {name} ({self._total_slices}层)")
+                return
+            # total > 1
             self.nodule_selector_widget.setVisible(True)
+            idx = min(max(self._current_nodule_idx, 0), total - 1)
+            self._apply_nodule_display(idx)
+            self._log(f"[图像] 切换到: {name} ({self._total_slices}层)")
+            return
         else:
             self.nodule_selector_widget.setVisible(False)
 
@@ -1529,7 +1624,6 @@ class MainWindow(QMainWindow):
         mapping = {
             "原始CT":   self.ct_array,
             "肺部分割": self.lung_mask_array,
-            "结节分割": self.nodule_segmentation_array,
         }
         target = mapping[name]
 
