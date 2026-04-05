@@ -44,6 +44,13 @@ def load_data(ct_path):
     # 重采样
     ct_resampled = nio_data.resample_array(ct_array, ct_space_info)
 
+    # 保存病例序号
+    case_id = os.path.basename(ct_path)
+    os.makedirs(temp_cache_dir, exist_ok=True)
+    case_id_path = os.path.join(temp_cache_dir, "case_id.txt")
+    with open(case_id_path, "w") as f:
+        f.write(case_id)
+
     # 将原始CT图像、空间信息和重采样后的CT图像保存为npy文件
     save_dir = os.path.join(temp_cache_dir, "ct_data_array")
     os.makedirs(save_dir, exist_ok=True)
@@ -52,7 +59,6 @@ def load_data(ct_path):
     np.save(os.path.join(save_dir, "ct_resampled.npy"), ct_resampled)
 
     return ct_array, ct_space_info, ct_resampled
-
 
 # 肺部分割
 def lung_segmentation(ct_array: np.ndarray, ct_space_info: dict):
