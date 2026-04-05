@@ -240,6 +240,7 @@ class MainWindow(QMainWindow):
         self.identify_results = None
         self.nodule_segmentation_results = None
         self.classification_results = None
+        self.dialectical_results = None
 
         self.ct_array = None
         self.ct_space_info = None
@@ -1096,6 +1097,7 @@ class MainWindow(QMainWindow):
         self.identify_results = None
         self.nodule_segmentation_results = None
         self.classification_results = None
+        self.dialectical_results = None
         self.ct_array = None
         self.lung_mask_array = None
         self.nodule_patch = []
@@ -1214,6 +1216,23 @@ class MainWindow(QMainWindow):
             self.show_classification_results()
             self._log(f"{prefix} 已加载结节分类结果")
             loaded_any = True
+        
+        # 6. 中医辨证结果
+        dialectical_results_dir = os.path.join(cache_base, "physiotherapy_cache")
+        dialectical_results_path = os.path.join(dialectical_results_dir, "dialectical_physiotherapy_results.json")
+        if os.path.exists(dialectical_results_path):
+            try:
+                import json
+                with open(dialectical_results_path, 'r', encoding='utf-8') as f:
+                    self.dialectical_results = json.load(f)
+                # 刷新日志显示辨证结果摘要
+                self._mark_process_done("中医辨证")
+                self.show_dialectical_results()
+                self._log(f"{prefix} 已加载中医辨证结果")
+                loaded_any = True
+            except Exception as e:
+                # 加载失败不影响其他结果显示
+                self._log(f"{prefix} 加载中医辨证结果失败: {e}")
 
         # 如果加载了数据，显示原始CT
         if loaded_any and self.ct_array is not None:
@@ -1612,7 +1631,16 @@ class MainWindow(QMainWindow):
             self.worker.start()
 
         elif name == "中医辨证":
-            self._log("[过程] 中医辨证：TODO")
+            if self.classification_results is None:
+                self._log("[过程] 错误：请先执行结节分类")
+                return
+            self._log("[过程] 执行: 中医辨证（运行中...）")
+            self._set_buttons_enabled(False)
+
+            self.worker = ProcessWorker(dialectical_physiotherapy, self.classification_results)
+            self.worker.finished.connect(self._on_dialectical_physiotherapy_done)
+            self.worker.error.connect(self._on_process_error)
+            self.worker.start()
 
         elif name == "全流程":
             self._log("[过程] 全流程：TODO")
@@ -1730,6 +1758,25 @@ class MainWindow(QMainWindow):
         self.show_classification_results()
 
         self.statusBar().showMessage("结节分类完成")
+        self._set_buttons_enabled(True)
+
+    def _on_dialectical_physiotherapy_done(self, result):
+        """
+        回调：中医辨证完成。
+        - 用法: 保存辨证结果并将理疗方案输出到中医辨证面板。
+        - 参数:
+            - result: 理疗方案字典。
+        - 返回:
+            - 无。
+        """
+        self.dialectical_results = result
+        self._log("[完成] 中医辨证: 生成理疗方案")
+        self._mark_process_done("中医辨证")
+
+        # 在中医辨证面板显示
+        self.show_dialectical_results()
+
+        self.statusBar().showMessage("中医辨证完成")
         self._set_buttons_enabled(True)
 
     def _on_process_error(self, error_msg):
@@ -1990,6 +2037,37 @@ class MainWindow(QMainWindow):
             lines.append("")
         # 直接覆盖显示，不追加
         self.result_text.setPlainText("\n".join(lines))
+
+    def show_dialectical_results(self):
+        """
+        显示中医辨证结果。
+        - 用法: 直接调用，根据辨证结果展示理疗方案。
+        - 参数:
+            - 无。
+        """
+        # 在中医辨证面板显示
+        if not hasattr(self, 'dialectical_results') or not self.dialectical_results:
+            self.tcm_text.setPlainText("中医辨证结果未生成")
+            return
+        
+        lines = []
+        lines.append("=== 中医辨证理疗方案 ===")
+        lines.append("")
+        
+        result = self.dialectical_results
+        lines.append(f"患者表征: {result.get('患者表征', '无')}")
+        lines.append("")
+        lines.append("针灸治疗:")
+        lines.append(f"{result.get('针灸治疗', '无')}")
+        lines.append("")
+        lines.append("中药选择:")
+        lines.append(f"{result.get('中药选择', '无')}")
+        lines.append("")
+        lines.append("食疗方案:")
+        lines.append(f"{result.get('食疗方案', '无')}")
+        
+        # 直接覆盖显示，不追加
+        self.tcm_text.setPlainText("\n".join(lines))
 
 
 # ================================================================

@@ -9,10 +9,14 @@ from Lung_segmentation.data_processor import DataProcessor as lung_segmentation_
 from nodules_identify.data_process import DataProcessor as nodules_identify_data_processor
 from nodules_segmentation.predict import NoduleSegmentationPredictor
 
+# 中医辨证模块
+from Dialectical_physiotherapy.dialectical_physiotherapy import dialectical_physiotherapy as dialectical_physiotherapy_func
+
 
 
 """全局变量"""
-temp_cache_dir = r".\temp_cache"
+# 使用脚本所在目录作为基础路径，确保路径解析可靠
+temp_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_cache")
 dataset_dir = r""
 output_dir = None
 
@@ -140,7 +144,6 @@ def nodules_identify(ct_data, is_use_mask=True):
 
     return identify_results
 
-
 # 分割结节
 def nodules_segmentation(ct_data, identify_results: list):
     """
@@ -217,6 +220,31 @@ def nodule_classification(nodules_segmentation_results):
 
     return classification_results
 
+# 中医辨证
+def dialectical_physiotherapy(classification_results):
+    """
+    中医辨证理疗方案生成
+    - 参数:
+        - classification_results: 分类结果列表
+    - 返回:
+        - Dict[str, str]: 理疗方案
+    """
+    # 调用中医辨证函数
+    plan = dialectical_physiotherapy_func(classification_results)
+    # 将辨证结果保存为JSON文件
+    try:
+        # 将辨证结果保存为JSON文件
+        import json
+        save_dir = os.path.join(temp_cache_dir, "physiotherapy_cache")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "dialectical_physiotherapy_results.json")
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(plan, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        pass
+    
+    return plan
+
 
 
 # 综合判断
@@ -247,7 +275,11 @@ if __name__ =="__main__":
     """4.分类结节"""
     classification_results = nodule_classification(nodules_segmentation_results)
 
-    """5.结果展示"""
+    """5.中医辨证"""
+    dialectical_plan = dialectical_physiotherapy(classification_results)
+
+    """6.结果展示"""
+    # 结节分类结果
     for idx, one_nodule_result in enumerate(classification_results):
         print("="*40,f"第 {idx+1} 个结节分类", "="*40)
         for task in one_nodule_result:
@@ -255,3 +287,8 @@ if __name__ =="__main__":
             prob = one_nodule_result[task]['class_probabilities']
             print(f"任务: {task}, 预测标签: {pred_label} \n预测为正类的概率: {prob}")
             print("="*40)
+    # 中医辨证理疗方案
+    print("="*40,f"中医辨证理疗方案", "="*40)
+    for key, value in dialectical_plan.items():
+        print(f"{key}: {value}")
+        print("="*40)
